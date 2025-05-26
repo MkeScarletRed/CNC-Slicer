@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image to G-Code Slicer</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; }
+    canvas { border: 1px solid #ccc; margin-top: 1rem; image-rendering: pixelated; cursor: grab; }
+    textarea { width: 100%; height: 300px; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Image to G-Code Slicer (220x220mm)</h1>
+  <input type="file" id="upload" accept="image/*"><br>
+  <label for="threshold">Threshold (brightness):</label>
+  <input type="range" id="threshold" min="0" max="255" value="128"><br>
+  <label for="invertColors">Invert Colors:</label>
+  <input type="checkbox" id="invertColors">
+  <button onclick="generateGCode()">Generate G-Code</button>
+  <br>
+  <canvas id="canvas" width="440" height="440" style="display:none;"></canvas>
+  <canvas id="preview" width="600" height="600"></canvas>
+  <textarea id="gcodeOutput" placeholder="Your G-code will appear here..."></textarea>
+
+  <script>
+    const MAX_SIZE = 220;
+    const SCALE_FACTOR = 2;
+    const Z_ENGRAVE = 0.25;
+    const Z_RAISE = 5;
+    const FEED_ENGRAVE = 1000;
+    const FEED_MOVE = 3000;
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const preview = document.getElementById('preview');
+    const previewCtx = preview.getContext('2d');
+    let imgData;
+    let zoom = 1;
+    let offsetX = 0, offsetY = 0;
+    let isDragging = false, startX, startY;
+    let drawnPaths = [];
+
+    document.getElementById('upload').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(MAX_SIZE / img.width, MAX_SIZE / img.height);
+        canvas.width = img.width * scale * SCALE_FACTOR;
+        canvas.height = img.height * scale * SCALE_FACTOR;
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        if (document.getElementById('invertColors').checked) {
+          invertColors();
+        }
+        drawPreview();
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    document.getElementById('invertColors').addEventListener('change', () => {
+      if (document.getElementById('invertColors').checked) {
+        invertColors();
+      } else {
+        drawImage();
+      }
+      drawPreview();
+    });
+
+    preview.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      zoom += e.deltaY * -0.001;
+      zoom = Math.min(Math.max(0.5, zoom), 5);
+      drawPreview();
+    });
+
+    preview.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      startX = e.offsetX;
+      startY = e.offsetY;
+      preview.style.cursor = 'grabbing';
+    });
+
+    preview.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        offsetX += (e.offsetX - startX);
+        offsetY += (e.offsetY - startY);
+        startX = e.offsetX;
+        startY = e.offsetY;
+        drawPreview();
+      }
+    });
+
+    preview.addEventListener('mouseup', () => {
+      isDragging = false;
+      preview.style.cursor = 'grab';
+    });
+
+    function invertColors() {
+      for (let i = 0; i < imgData.data.length; i += 4) {
+        imgData.data[i] = 255 - imgData.data[i]; // Red
+        imgData.data[i + 1] = 255 - imgData.data[i + 1]; // Green
+        imgData.data[i + 2] = 255 - imgData.data[i + 2]; // Blue
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    function drawImage() {
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    function drawPreview() {
+      previewCtx.setTransform(1, 0, 0, 1, 0, 0);
+      previewCtx.clearRect(0, 0, preview.width, preview.height);
+      previewCtx.setTransform(zoom, 0, 0, zoom, offsetX, offsetY);
+
+      previewCtx.strokeStyle = 'black';
+      previewCtx.lineWidth = 0.5 / zoom;
+
+      drawnPaths.forEach(path => {
+        previewCtx.beginPath();
+        previewCtx.moveTo(path[0].x, path[0].y);
+        for (let i = 1; i < path.length; i++) {
+          previewCtx.lineTo(path[i].x, path[i].y);
+        }
+        previewCtx.stroke();
+      });
+    }
+
+    function generateGCode() {
+      const threshold = document.getElementById('threshold').value;
+      const output = [
+        'G28 ; Home',
+        'G90 ; Absolute positioning',
+        `G0 Z${Z_RAISE} F${FEED_MOVE}`
+      ];
+
+      drawnPaths = [];
+
+      let engraving = false;
+      let currentPath = [];
+      for (let y = 0; y < imgData.height; y++) {
+        let rowDirection = y % 2 === 0 ? 1 : -1;
+        for (let x = rowDirection > 0 ? 0 : imgData.width - 1;
+                 rowDirection > 0 ? x < imgData.width : x >= 0;
+                 x += rowDirection) {
+
+          const index = (y * imgData.width + x) * 4;
+          const brightness = (imgData.data[index] + imgData.data[index + 1] + imgData.data[index + 2]) / 3;
+          const mmX = (x / imgData.width) * MAX_SIZE;
+          const mmY = (y / imgData.height) * MAX_SIZE;
+
+          const pxX = mmX * SCALE_FACTOR;
+          const pxY = mmY * SCALE_FACTOR;
+
+          if (brightness < threshold) {
+            if (!engraving) {
+              output.push(`G0 X${mmX.toFixed(2)} Y${mmY.toFixed(2)} F${FEED_MOVE}`);
+              output.push(`G1 Z${Z_ENGRAVE} F500`);
+              currentPath = [{x: pxX, y: pxY}];
+              engraving = true;
+            } else {
+              currentPath.push({x: pxX, y: pxY});
+            }
+            output.push(`G1 X${mmX.toFixed(2)} Y${mmY.toFixed(2)} F${FEED_ENGRAVE}`);
+          } else {
+            if (engraving) {
+              output.push(`G0 Z${Z_RAISE} F${FEED_MOVE}`);
+              drawnPaths.push(currentPath);
+              engraving = false;
+            }
+          }
+        }
+        if (engraving) {
+          drawnPaths.push(currentPath);
+          engraving = false;
+          output.push(`G0 Z${Z_RAISE} F${FEED_MOVE}`);
+        }
+      }
+
+      output.push(`G0 Z${Z_RAISE} F${FEED_MOVE}`);
+      output.push('G0 X117.5 Y117.5 F3000 ; Return to center');
+
+      document.getElementById('gcodeOutput').value = output.join('\n');
+      drawPreview();
+    }
+  </script>
+</body>
+</html>
